@@ -1,0 +1,625 @@
+---
+title: "creedenzymatic"
+author: "Khaled Alganem"
+date: "6/23/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+library(creedenzymatic)
+library(tidyverse)
+
+ks_string <- function(gene, score, nodes, get_img = T, high_res = F, multi = F) {
+  
+  
+  # get interactors 
+  if(multi) {
+    api_url <- paste0("https://string-db.org/api/json/network?identifiers=",
+                      paste0(gene, collapse = "%0d"),"&species=9606&required_score=",
+                      score)
+    
+  }
+  
+  else {
+    api_url <- paste0("https://string-db.org/api/json/interaction_partners?identifiers=",
+                      gene,"&species=9606&required_score=",
+                      score,"&limit=",nodes)
+  }
+  
+  
+  table_res <- httr::GET(api_url)
+  
+  meta_tag <- F
+  
+  if(table_res$status < 300) {
+    table_string <- jsonlite::fromJSON(httr::content(table_res))
+    
+    message("got interactors")
+    
+    #IdList <- c(gene, dplyr::pull(table_string, preferredName_B))
+    
+    if(identical(table_string, list())) {
+      IdList <- gene
+    }
+    
+    else {
+      IdList <- c(gene[1], dplyr::pull(table_string, preferredName_B), dplyr::pull(table_string, preferredName_A)) %>% unique()
+      
+      if(multi) {
+        table_string <- dplyr::select(table_string, -stringId_A,-stringId_B,-ncbiTaxonId)
+      } else {
+        table_string <- dplyr::add_row(table_string, preferredName_B = gene) %>% 
+          dplyr::select(-preferredName_A, -stringId_A,-stringId_B,-ncbiTaxonId) %>% 
+          dplyr::rename(preferredName = preferredName_B)
+        
+      }
+    }
+    
+    
+    
+    
+    
+    #  Get gene info
+    intr_info_api_url <- paste0("https://string-db.org/api/json/resolve?identifiers=",
+                                paste(IdList,collapse ="%0D"),
+                                "&species=9606")
+    
+    table_info_res <- httr::GET(intr_info_api_url)
+    
+    if(table_info_res$status < 300) {
+      table_string_meta <- jsonlite::fromJSON(httr::content(table_info_res))
+      
+      message("got meta info")
+      
+      table_string_meta <- dplyr::select(table_string_meta,preferredName, annotation)
+      
+      interactors <- IdList
+      
+      if(identical(table_string, list())) {
+        table_string_meta %>% 
+          dplyr::select(preferredName, annotation) %>% 
+          mutate(score = 0, nscore=0, fscore = 0, pscore = 0, dscore = 0, tscore = 0, ascore= 0, escore = 0) %>% 
+          dplyr::rename(Protein = preferredName, CombinedScore = score, Description = annotation,Neighborhood = nscore, 
+                        `Gene Fusion` =  fscore, Phylogenetic = pscore, 
+                        Database = dscore, Textmining = tscore, CoExpression = ascore,
+                        Experimental = escore) %>% 
+          dplyr::select(Protein, CombinedScore, Description, Experimental, Database, everything()) -> table_string_final
+      }
+      
+      else {
+        if(multi) {
+          left_join(table_string, table_string_meta, 
+                    by = c("preferredName_A" = "preferredName")) %>% 
+            left_join(table_string_meta, by = c("preferredName_B" = "preferredName")) %>% 
+            rowwise() %>% 
+            mutate(annotation = paste(paste0(preferredName_A,": ",annotation.x), paste0(preferredName_B,": ", 
+                                                                                        annotation.y), sep = "<br><br>")) %>% 
+            select(preferredName_A, preferredName_B, score, annotation, ends_with("score")) %>% 
+            dplyr::arrange(desc(score)) %>% 
+            dplyr::rename(Protein_A = preferredName_A, Protein_B = preferredName_B, 
+                          CombinedScore = score, Description = annotation,Neighborhood = nscore, 
+                          `Gene Fusion` =  fscore, Phylogenetic = pscore, 
+                          Database = dscore, Textmining = tscore, CoExpression = ascore,
+                          Experimental = escore) %>% 
+            rowwise() %>% 
+            mutate(Protein = paste0(Protein_A, "---", Protein_B)) %>% 
+            dplyr::select(Protein, CombinedScore, 
+                          Description, Experimental, Database, everything(), -Protein_A, -Protein_B) -> table_string_final
+        }
+        else {
+          table_string_meta %>% 
+            dplyr::full_join(table_string) %>% 
+            dplyr::select(preferredName, score, annotation, ends_with("score")) %>% 
+            dplyr::arrange(desc(score)) %>% 
+            dplyr::rename(Protein = preferredName, CombinedScore = score, Description = annotation,Neighborhood = nscore, 
+                          `Gene Fusion` =  fscore, Phylogenetic = pscore, 
+                          Database = dscore, Textmining = tscore, CoExpression = ascore,
+                          Experimental = escore) %>% 
+            dplyr::select(Protein, CombinedScore, Description, Experimental, Database, everything()) %>% 
+            dplyr::arrange(desc(CombinedScore)) -> table_string_final
+        }
+        
+      }
+      
+      
+      
+      meta_tag <- T
+    }
+    
+    if(all(table_res$status < 300, meta_tag)) {
+      
+      # return(list(
+      #   table = table_string_final,
+      #   genes = interactors
+      #   #image = img_plot 
+      # ))
+      
+      interactors
+    }
+    else {
+      message("Can't find Target")
+      return(NULL)
+    }
+    
+  }
+  
+  
+}
+```
+
+## Kinome integration (NUCLEAR VS CYTOSOLIC)
+
+```{r krsaExample1}
+
+# reading an example of KRSA output
+krsa_1 <- read_delim("../processed_data/comparisons/NUCLEAR_vs_CYTOSOLIC_KRSA_Table_withinChip.txt", delim = "\t") %>%
+  select(Kinase, AvgZ) %>%
+  distinct(Kinase, .keep_all = T) %>%
+  rename(Score = AvgZ)
+
+
+krsa_lfc_1 <- read_delim("../processed_data/comparisons/NUCLEAR_vs_CYTOSOLIC__LFC_table.txt", delim = "\t") %>%
+  select(Peptide, Score = totalMeanLFC) %>%
+  distinct(Peptide, .keep_all = T)
+
+uka_1 <- read_delim("../processed_data/comparisons/uka/NuclearvsCytosolic/Summaryresults 20210624-1207.txt", delim = "\t") %>%
+  select(`Kinase Name`, `Median Final score`) %>%
+  rename(Kinase = `Kinase Name`, Score = `Median Final score`)
+```
+
+
+```{r}
+
+# read and rank the KRSA table and use absolute values and descending sorting
+read_krsa(krsa_1, trns = "abs", sort = "desc") -> krsa_table_ranked
+
+
+# read and rank the UKA table and use absolute values and descending sorting
+read_uka(uka_1, trns = "abs", sort = "desc") -> uka_table_ranked
+
+read_kea(krsa_lfc_1, filter = T, cutoff = 0.6, cutoff_abs = T, sort = "asc", trns = "abs") -> kea_table_ranked
+
+
+
+krsa_lfc_1 %>%
+  filter(abs(Score) <= 0.6) %>%
+  dplyr::left_join(rbind(stk_pamchip_87102_mapping, ptk_pamchip_86402_mapping), by = c("Peptide" = "ID")) %>%
+  dplyr::filter(!is.na(HGNC)) %>%
+  pull(HGNC) %>%
+  cat(sep = "\n")
+#
+#
+# pep_hits %>%
+#   cat(sep = "\n")
+```
+
+
+```{r}
+
+# combine ranked tables
+combine_tools(KRSA_df = krsa_table_ranked, UKA_df = uka_table_ranked, KEA3_df = kea_table_ranked) -> combined_df
+
+
+# combined_df
+
+
+```
+
+
+```{r, fig.align="center", fig.height=5,fig.width=20}
+
+# filter out kinases found in quartile 1 or 2 either in KRSA or UKA and use the quartile_figure() for visualization
+
+
+combined_df %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Qrt, Method) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = Qrt, values_fill = 0) -> combined_df_wide
+
+# found in all
+combined_df_wide %>%
+  filter(rowSums(.[3:5] != 0) >= 3) %>%
+  pull(hgnc_symbol) %>%
+  unique() -> sig_kinases_1_inAll
+
+# equal or under 3 qrt in at least 2 methods
+combined_df_wide %>%
+  filter(rowSums(.[3:5] != 0 & .[3:5] >= 3) >= 2) %>%
+  pull(hgnc_symbol) %>%
+  unique() -> sig_kinases_1_above_3rdqrt
+
+
+
+# combined_df %>% filter(Method %in% c("KRSA", "UKA")) %>%
+#   dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Qrt, Method) %>%
+#   tidyr::pivot_wider(names_from = Method, values_from = Qrt) %>%
+#   filter(KRSA <= 2, UKA <= 2) %>%
+#   pull(hgnc_symbol) %>% unique() -> sig_kinases_1
+#
+# combined_df %>%  filter(!is.na(hgnc_symbol)) %>%
+# dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Qrt, Method) %>%
+#   tidyr::pivot_wider(names_from = Method, values_from = Qrt) %>%
+#   filter_if(is.numeric,  ~ .x <= 3) %>%
+#   #filter(KRSA <= 2, UKA <= 2 | KEA3 <= 2) %>%
+#   pull(hgnc_symbol) %>% unique() -> sig_kinases_strict_1
+
+
+# combined_df %>%
+#   filter(hgnc_symbol %in% c(sig_kinases_strict_1)) %>% filter(!is.na(hgnc_symbol)) %>%
+#   quartile_figure()
+
+
+combined_df %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Perc, Method) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = Perc, values_fill = NA) -> combined_df_1_wide_perc
+
+combined_df_1_wide_perc %>%
+  rowwise() %>%
+  mutate(
+    AvgPerc_Mean = mean(c(KEA3, KRSA, UKA), na.rm = T),
+    AvgPerc_Median = median(c(KEA3, KRSA, UKA), na.rm = T),
+  ) %>%
+  arrange(desc(AvgPerc_Mean)) -> combined_df_1_wide_perc
+
+
+combined_df_1_wide_perc$na_sum <- rowSums(is.na(combined_df_1_wide_perc))
+
+
+
+combined_df_1_wide_perc %>% 
+  filter(na_sum <=1, AvgPerc_Mean >= 0.75) %>% pull(hgnc_symbol) -> nuc_vs_cyto_kinases
+
+
+nuc_vs_cyto_kinases %>% 
+  cat(sep = "\n")
+
+combined_df %>%
+  filter(hgnc_symbol %in% c(sig_kinases_1_inAll)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  labs(subtitle = "Found in all 3 tools")
+
+combined_df %>%
+  filter(hgnc_symbol %in% c(sig_kinases_1_above_3rdqrt)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  labs(subtitle = "Equal or under 2nd qrt in at least 2 tools") +
+  theme(axis.text.x = element_text(angle = 30, size = 6, vjust = 0.7))
+
+combined_df %>%
+  filter(hgnc_symbol %in% c(nuc_vs_cyto_kinases)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  theme(axis.text.x = element_text(angle = 30, size = 6, vjust = 0.7))
+
+```
+
+
+## Kinome integration (SYNAPTOSOMAL vs CYTOSOLIC)
+
+```{r krsaExample2}
+
+# reading an example of KRSA output
+krsa_2 <- read_delim("../processed_data/comparisons/SYNAPTOSOMAL_vs_CYTOSOLIC_KRSA_Table_withinChip.txt", delim = "\t") %>%
+  select(Kinase, AvgZ) %>%
+  distinct(Kinase, .keep_all = T) %>%
+  rename(Score = AvgZ)
+
+
+krsa_lfc_2 <- read_delim("../processed_data/comparisons/SYNAPTOSOMAL_vs_CYTOSOLIC_LFC_table.txt", delim = "\t") %>%
+  select(Peptide, Score = totalMeanLFC) %>%
+  distinct(Peptide, .keep_all = T)
+
+uka_2 <- read_delim("../processed_data/comparisons/uka/SynpatosomalvsCytosolic/Summaryresults 20210624-1201.txt", delim = "\t") %>%
+  select(`Kinase Name`, `Median Final score`) %>%
+  rename(Kinase = `Kinase Name`, Score = `Median Final score`)
+```
+
+
+```{r}
+
+# read and rank the KRSA table and use absolute values and descending sorting
+read_krsa(krsa_2, trns = "abs", sort = "desc") -> krsa_table_ranked_2
+
+# read and rank the UKA table and use absolute values and descending sorting
+read_uka(uka_2, trns = "abs", sort = "desc") -> uka_table_ranked_2
+
+read_kea(krsa_lfc_2, filter = T, cutoff = 0.6, cutoff_abs = T, sort = "asc", trns = "abs") -> kea_table_ranked_2
+
+
+# krsa_lfc_2 %>% filter(abs(Score) <= 0.4) %>%
+#     dplyr::left_join(rbind(stk_pamchip_87102_mapping, ptk_pamchip_86402_mapping), by = c("Peptide" = "ID")) %>%
+#     dplyr::filter(!is.na(HGNC)) %>%
+#     pull(HGNC) -> pep_hits
+#
+#
+# pep_hits %>%
+#   cat(sep = "\n")
+```
+
+
+```{r}
+
+# combine ranked tables
+combine_tools(KRSA_df = krsa_table_ranked_2, UKA_df = uka_table_ranked_2, KEA3_df = kea_table_ranked_2) -> combined_df_2
+
+
+# combined_df
+
+# to save file
+write_delim(combined_df_2,"SYNAPTOSOMAL_vs_CYTOSOLIC_ce_combined_ranked_file.txt", delim = "\t")
+```
+
+
+```{r, fig.align="center", fig.height=5,fig.width=20}
+
+# filter out kinases found in quartile 1 or 2 either in KRSA or UKA and use the quartile_figure() for visualization
+
+
+combined_df_2 %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Qrt, Method) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = Qrt, values_fill = 0) -> combined_df_2_wide
+
+
+combined_df_2 %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Perc, Method) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = Perc, values_fill = NA) -> combined_df_2_wide_perc
+
+combined_df_2_wide_perc %>%
+  rowwise() %>%
+  mutate(
+    AvgPerc_Mean = mean(c(KEA3, KRSA, UKA), na.rm = T),
+    AvgPerc_Median = median(c(KEA3, KRSA, UKA), na.rm = T),
+  ) %>%
+  arrange(desc(AvgPerc_Mean)) -> combined_df_2_wide_perc
+
+
+combined_df_2_wide_perc$na_sum <- rowSums(is.na(combined_df_2_wide_perc))
+
+
+
+
+combined_df_2_wide_perc %>% 
+  filter(na_sum <=1, AvgPerc_Mean >= 0.75) %>% pull(hgnc_symbol) -> syn_vs_cyto_kinases
+
+
+# found in all
+combined_df_2_wide %>%
+  filter(rowSums(.[3:5] != 0) >= 3) %>%
+  pull(hgnc_symbol) %>%
+  unique() -> sig_kinases_2_inAll
+
+# equal or under 3 qrt in at least 2 methods
+combined_df_2_wide %>%
+  filter(rowSums(.[3:5] != 0 & .[3:5] >= 3) >= 2) %>%
+  pull(hgnc_symbol) %>%
+  unique() -> sig_kinases_2_above_3rdqrt
+
+
+combined_df_2 %>%
+  filter(hgnc_symbol %in% c(sig_kinases_2_inAll)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  labs(subtitle = "Found in all 3 tools")
+
+
+pdf("output/figures/syn_vs_cyto_QuartileFigure.pdf", useDingbats = F, width = 10, height = 4)
+combined_df_2 %>%
+  filter(hgnc_symbol %in% c(syn_vs_cyto_kinases)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  theme(axis.text.x = element_text(angle = 30, size = 5, vjust = 0.7))
+dev.off()
+
+
+```
+
+
+## Kinome integration (SYNAPTOSOMAL VS NUCLEAR)
+
+
+```{r krsaExample3}
+
+# reading an example of KRSA output
+krsa_3 <- read_delim("../processed_data/comparisons/SYNAPTOSOMAL_vs_NUCLEAR_KRSA_Table_withinChip.txt", delim = "\t") %>%
+  select(Kinase, AvgZ) %>%
+  distinct(Kinase, .keep_all = T) %>%
+  rename(Score = AvgZ)
+
+
+krsa_lfc_3 <- read_delim("../processed_data/comparisons/SYNAPTOSOMAL_vs_NUCLEAR_LFC_table.txt", delim = "\t") %>%
+  select(Peptide, Score = totalMeanLFC) %>%
+  distinct(Peptide, .keep_all = T)
+
+uka_3 <- read_delim("../processed_data/comparisons/uka/SynptosomalVsNuclear/Summaryresults 20210824-1504_lowQC.txt", delim = "\t") %>%
+  select(`Kinase Name`, `Median Final score`) %>%
+  rename(Kinase = `Kinase Name`, Score = `Median Final score`)
+```
+
+
+```{r}
+
+# read and rank the KRSA table and use absolute values and descending sorting
+read_krsa(krsa_3, trns = "abs", sort = "desc") -> krsa_table_ranked
+
+
+# read and rank the UKA table and use absolute values and descending sorting
+read_uka(uka_3, trns = "abs", sort = "desc") -> uka_table_ranked
+
+read_kea(krsa_lfc_3, filter = T, cutoff = 0.6, cutoff_abs = T, sort = "asc", trns = "abs") -> kea_table_ranked
+
+
+krsa_lfc_3 %>%
+  filter(abs(Score) <= 0.6) %>%
+  dplyr::left_join(rbind(stk_pamchip_87102_mapping, ptk_pamchip_86402_mapping), by = c("Peptide" = "ID")) %>%
+  dplyr::filter(!is.na(HGNC)) %>%
+  pull(HGNC) %>%
+  cat(sep = "\n")
+
+```
+
+
+```{r}
+
+# combine ranked tables
+combine_tools(KRSA_df = krsa_table_ranked, UKA_df = uka_table_ranked, KEA3_df = kea_table_ranked) -> combined_df3
+
+```
+
+
+```{r, fig.align="center", fig.height=5,fig.width=20}
+
+# filter out kinases found in quartile 1 or 2 either in KRSA or UKA and use the quartile_figure() for visualization
+
+combined_df3 %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Qrt, Method) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = Qrt, values_fill = 0) -> combined_df_wide
+
+combined_df_wide$hgnc_symbol %>%
+  unique() %>%
+  cat(sep = "\n")
+
+# found in all
+combined_df_wide %>%
+  filter(rowSums(.[3:5] != 0) >= 3) %>%
+  pull(hgnc_symbol) %>%
+  unique() -> sig_kinases_3_inAll
+
+# equal or under 3 qrt in at least 2 methods
+combined_df_wide %>%
+  filter(rowSums(.[3:5] != 0 & .[3:5] <= 2) >= 2) %>%
+  pull(hgnc_symbol) %>%
+  unique() -> sig_kinases_3_above_3rdqrt
+
+
+combined_df3 %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  dplyr::select(hgnc_symbol, one_of("KinaseFamily"), Perc, Method) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = Perc, values_fill = NA) -> combined_df_3_wide_perc
+
+combined_df_3_wide_perc %>%
+  rowwise() %>%
+  mutate(
+    AvgPerc_Mean = mean(c(KEA3, KRSA, UKA), na.rm = T),
+    AvgPerc_Median = median(c(KEA3, KRSA, UKA), na.rm = T),
+  ) %>%
+  arrange(desc(AvgPerc_Mean)) -> combined_df_3_wide_perc
+
+
+combined_df_3_wide_perc$na_sum <- rowSums(is.na(combined_df_3_wide_perc))
+
+
+combined_df_3_wide_perc %>% 
+  filter(na_sum <=1, AvgPerc_Mean >= 0.75) %>% pull(hgnc_symbol) -> syn_vs_nuc_kinases
+
+
+combined_df_3_wide_perc %>% 
+  filter(na_sum <=1) %>% 
+  pull(hgnc_symbol) %>% 
+  cat(sep = "\n")
+
+combined_df3 %>%
+  filter(hgnc_symbol %in% c(sig_kinases_3_inAll)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  labs(subtitle = "Found in all 3 tools")
+
+combined_df3 %>%
+  filter(hgnc_symbol %in% c(sig_kinases_3_above_3rdqrt)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  labs(subtitle = "Equal or under 2nd qrt in at least 2 tools") +
+  theme(axis.text.x = element_text(angle = 30, size = 6, vjust = 0.7))
+
+
+pdf("output/figures/syn_vs_nuc_QuartileFigure.pdf", useDingbats = F, width = 10, height = 4)
+combined_df3 %>%
+  filter(hgnc_symbol %in% c(syn_vs_nuc_kinases)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  quartile_figure() +
+  theme(axis.text.x = element_text(angle = 30, size = 5, vjust = 0.7))
+dev.off()
+
+
+syn_vs_cyto_kinases %>%
+  cat(sep = "\n")
+# 
+nuc_vs_cyto_kinases %>%
+  cat(sep = "\n")
+
+syn_vs_nuc_kinases %>%
+  cat(sep = "\n")
+
+kin_tree_file <- tibble(
+  Kinase = c(syn_vs_cyto_kinases, nuc_vs_cyto_kinases)
+)
+
+
+kin_tree_file %>% 
+  mutate(Group = case_when(
+    Kinase %in% intersect(syn_vs_cyto_kinases, nuc_vs_cyto_kinases) ~ "Both",
+    Kinase %in% syn_vs_cyto_kinases ~ "Syn",
+    Kinase %in% nuc_vs_cyto_kinases ~ "Nuc"
+  )) -> kin_tree_file
+
+# uplaod to kinmap (http://www.kinhub.org/kinmap/)
+kin_tree_file %>% 
+  distinct() %>% 
+  filter(Group == "Nuc") %>% 
+  pull(Kinase) %>% 
+  cat(sep = "\n")
+
+```
+
+
+```{r}
+# string
+
+ks_test <- map(syn_vs_cyto_kinases, ks_string, score = 500, nodes = 20, get_img = F)
+  
+unique(unlist(ks_test)) %>% 
+  cat(sep = "\n")
+
+
+
+ks_string_nuc <- map(nuc_vs_cyto_kinases, ks_string, score = 500, nodes = 20, get_img = F)
+  
+unique(unlist(ks_string_nuc)) %>% 
+  cat(sep = "\n")
+
+
+combined_df_3_wide_perc %>% 
+  filter(na_sum <=1, AvgPerc_Mean >= 0.75) %>% pull(hgnc_symbol) -> syn_vs_nuc_kinases
+
+ks_string_syn_vs_nuc <- map(syn_vs_nuc_kinases, ks_string, score = 500, nodes = 20, get_img = F)
+
+
+uniqe_nuc <- filter(kin_tree_file, Group == "Nuc") %>% pull(Kinase)
+uniqe_syn <- filter(kin_tree_file, Group == "Syn") %>% pull(Kinase)
+common_kinases <- filter(kin_tree_file, Group == "Both") %>% pull(Kinase) %>% unique()
+
+ks_string_uni_nuc <- map(uniqe_nuc, ks_string, score = 500, nodes = 20, get_img = F)
+ks_string_uni_syn <- map(uniqe_syn, ks_string, score = 500, nodes = 20, get_img = F) 
+
+unique(unlist(ks_string_uni_nuc)) %>% 
+  cat(sep = "\n")
+
+unique(unlist(ks_string_syn_vs_nuc)) %>% 
+  cat(sep = "\n")
+
+unique(unlist(ks_string_uni_syn)) %>% 
+  cat(sep = "\n")
+
+
+# cat(uniqe_nuc, sep = "\n")
+# cat(uniqe_syn, sep = "\n")
+# cat(uniqe_nuc, sep = "\n")
+# 
+# cat(syn_vs_nuc_kinases, sep = "\n")
+
+```

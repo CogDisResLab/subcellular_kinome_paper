@@ -1,0 +1,159 @@
+---
+title: "Nuclear vs Cytosolic"
+output: pdf_document
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  echo = F, message = F, warning = F
+)
+```
+
+```{r setup}
+library(KRSA)
+library(knitr)
+library(tidyverse)
+library(furrr)
+```
+
+```{r model, warning=F,include=T, cache=TRUE}
+
+# read processed data
+
+readRDS("../processed_data/global/data_modelded.rds") -> data_modeled
+readRDS("../processed_data/global/qc_peptides.rds") -> new_pep
+readRDS("../processed_data/global/data_pw_200.rds") -> data_pw_200
+
+```
+
+
+## Group Comparison
+
+To compare between samples, a two-group comparison is performed. In this case, the two group comparisons are:
+
+* NUCLEAR vs CYTOSOLIC  
+ 
+The *Slope_Transforemed* ratio between each group, paired by chip, is calculated to the fold change. Based on the fold change, peptides that pass a certain fold change threshold are considered significant hits. Also, quality control steps applied in each comparison to filter out peptides that do not reach specific criteria:
+
+-   The *Medain_SigmBg* at max exposure *200ms* must be above a certain value\
+-   $R^2$ of the linear model fit must be above a threshold value
+
+These *Filtering Parameters* (fold change threshold, QC criteria) can be modified to adjust the stringency of the analysis. The main *Filtering Parameters* that are used for this analysis:
+
+-   The *Medain_SigmBg* at max exposure *200ms* must be equal or above 5\
+-   $R^2$ of the linear model fit must be above or equal 0.9\
+-   Log fold change (LFC) cutoffs at (0.6, 1.1, 1.6, 2.1, 2.6)
+
+```{r groupDiff1,echo=F, fig.height=8,fig.width=8,fig.align="center", cache=TRUE}
+
+# Define Groups to be compared
+comparisons <- list(Comp1 = c("NUCLEAR", "CYTOSOLIC"))
+
+# This function will run both QC steps (krsa_filter_lowPeps, krsa_filter_nonLinear) and krsa_filter_ref_pep
+krsa_quick_filter(data = data_pw_200, data2 = data_modeled$scaled,
+    signal_threshold = 5, r2_threshold = 0.9,
+    groups = comparisons$Comp1) -> pep_passed_qc
+
+# This function calculates log2 fold change values between the defined groups
+# The byChip argument lets you calculates the log2 fold change the results within each chip
+krsa_group_diff(data_modeled$scaled, comparisons$Comp1, pep_passed_qc, byChip = T) -> diff_df
+
+#sve LFC table
+#write_delim(diff_df, "NUCLEAR_vs_CYTOSOLIC__LFC_table.txt", delim = "\t")
+
+
+# Extract top peptides based on the LFC cutoff
+krsa_get_diff(diff_df,totalMeanLFC ,c(0.6, 1.1, 1.6, 2.1, 2.6)) %>% list("meanLFC" = .) -> sigPeps
+krsa_get_diff_byChip(diff_df, LFC, c(0.6, 1.1, 1.6, 2.1, 2.6)) -> sigPepsPerChip
+
+# Combine the peptides hits in one list
+sigPeps_total <- list(sigPeps, sigPepsPerChip) %>% unlist(recursive = F) %>%  unlist(recursive = F)
+
+
+```
+
+\newpage
+
+
+
+### NUCLEAR vs CYTOSOLIC (Upstream Kinase Analysis)
+
+The lab carefully curated and mapped the kinases that can act and phosphorylate each peptide present on the chip. This was achieved by using multiple sources including GPS 3.0, Kinexus Phosphonet, PhosphoELM and PhosphoSite Plus. Based on that association between peptides and kinases, a random sampling analysis is performed for these hits. The basic idea of *KRSA* is: For each iteration (*2000* iterations performed in this analysis), the same number of hits are randomly selected from the total 141/or 193 peptides present on the chip. Predicted kinases are then mapped to this sample list of peptides and number of kinases are determined. The kinase count from the actual hits and random sampling is then compared to determine the significance.
+
+```{r krsa1, echo=F, warning=F, message=FALSE, fig.align="center", fig.height=8, fig.width=8, cache=TRUE}
+
+
+# load in chip coverage and kinase-substrate files OR upload your own files
+# if PTK chip, use:
+# chipCov <- KRSA_coverage_PTK_PamChip_86402_v1
+# KRSA_file <- KRSA_Mapping_PTK_PamChip_86402_v1
+
+# STK chip
+chipCov <- KRSA_coverage_STK_PamChip_87102_v2
+KRSA_file <- KRSA_Mapping_STK_PamChip_87102_v1
+
+
+
+# run the KRSA function to do the random sampling analysis, set seed that can be used later to reproduce results, and choose number of iterations
+krsa(sigPeps$meanLFC$`0.6`, return_count = T, seed = 123, itr = 2000,
+     map_file = KRSA_file, cov_file = chipCov) -> fin
+
+# View the Z score table
+kable(head(fin$KRSA_Table,25), digits = 3)
+
+# to save file
+#fin$KRSA_Table %>% write_delim("acrossChip_KRSA_FullTable_comp1.txt", delim = "\t")
+
+# find top and bottom kinases
+bothways <- c(pull(head(fin$KRSA_Table, 10), Kinase), pull(tail(fin$KRSA_Table, 10), Kinase))
+
+# Use these kinase to generate histogram plots for each selected kinase
+krsa_histogram_plot(fin$KRSA_Table, fin$count_mtx, bothways)
+
+
+# For parallel computing, load the furrr package:
+# opens multiple R sessions to run faster
+plan(multisession)
+
+# Run the KRSA function across the different sets of peptides using the furrr package for parallel computing
+future_map(sigPeps_total, krsa) -> mutiple_krsa_outputs
+
+
+# For none parallel computing:
+# Run KRSA function across the different sets of peptides
+#map(sigPeps_total, krsa) -> mutiple_krsa_outputs
+
+# Tidy output
+df <- data.frame(matrix(unlist(mutiple_krsa_outputs), ncol = max(lengths(mutiple_krsa_outputs)), byrow = TRUE))
+df <- setNames(do.call(rbind.data.frame, mutiple_krsa_outputs), names(mutiple_krsa_outputs$meanLFC.0.6))
+
+df %>% rownames_to_column("method") %>% select(Kinase, Z, method) %>% 
+  mutate(method = str_extract(method, "\\w+\\.\\w+\\.\\w+")) %>% 
+  mutate(method = gsub("(^\\w+)[\\.]", "\\1>", method)) %>% 
+  mutate_if(is.numeric, round, 2) -> df
+
+df %>% 
+  pivot_wider(names_from = method, values_from = Z) -> df2
+  
+
+# Creates an average Z score table using the across chip analysis
+df %>% 
+  filter(grepl("mean", method)) %>% 
+  select(Kinase, Z, method) %>% group_by(Kinase) %>% mutate(AvgZ = mean(Z)) -> AvgZTable
+
+# save file
+AvgZTable %>% write_delim("../processed_data/comparisons/NUCLEAR_vs_CYTOSOLIC_KRSA_Table_acrossChip.txt", delim = "\t")
+
+# Creates an average Z score table using the within chip analysis
+df %>% 
+  filter(!grepl("mean", method)) %>% 
+  select(Kinase, Z, method) %>% group_by(Kinase) %>% mutate(AvgZ = mean(Z)) -> AvgZTable2
+
+# save file
+AvgZTable2 %>% write_delim("../processed_data/comparisons/NUCLEAR_vs_CYTOSOLIC_KRSA_Table_withinChip.txt", delim = "\t")
+
+
+```
+

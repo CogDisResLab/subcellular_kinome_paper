@@ -1,0 +1,126 @@
+---
+title: "Preprocess Global Signals"
+output: pdf_document
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  echo = F, message = F, warning = F
+)
+```
+
+```{r setup}
+library(KRSA)
+library(knitr)
+library(tidyverse)
+```
+
+# Introduction
+
+## Background
+
+The Pamstation12 instrument provides a profiling of kinase activity of cell or tissue samples. The device is loaded with either serine/threonine or tyrosine microarray chips. Each chip has 4 wells so four samples can be loaded on a single chip, and the Pamstation12 can accommodate 3 chips per run. The microarray represents 144 (STK chip) or 196 (PTK chip) reporter peptides that can be phosphorylated by serine/threonine or tyrosine kinases. The device measures the degree of the phosphorylation in real time by detecting fluorescently labeled antibodies at different exposure times. The list of peptides present in each microarray can be viewed here: [STK chip](https://pamgene.com/wp-content/uploads/2020/09/STK-144-PamChip-87102.pdf), [PTK chip](https://pamgene.com/wp-content/uploads/2020/09/PTK-196-PamChip-86402.pdf)
+
+\newpage
+
+```{r, echo=F,out.width = "400px",out.width="450px", fig.align='center', cache=TRUE}
+knitr::include_graphics("images/pamgene_workflow.png")
+knitr::include_graphics("images/pamgene_detectionFig.png")
+```
+
+
+# Results
+
+## Image Analysis
+
+The first step of analyzing the run is to convert the images taken by the PamStation of each array at different exposure times to numerical values This is done by the Bionavigator software developed by Pamgene. The software recognizes the grid of the array with the aid of the searching algorithm (Pamgrid) to correctly identify each spot on the array. The numbers produced by this software represent the median value of the foreground pixels minus the median value of the background pixels to produce the median signal minus background (Median_SigmBg).
+
+## Reading Data
+
+The first step will be reading the crosstab view bionavigator files (Median_SigmBg and Signal_Saturation) and defining the PamChip type (STK or PTK). The raw data is read and then transformed to be in tidy format for an easier analysis, modeling, and visualizing.
+
+```{r readData, include=T, cache=TRUE}
+
+# Define chip type
+chipType <- "STK"
+
+# Read crosstab view bionavigator files and tidy data
+data <- krsa_read("../processed_data/_ExportstosDBstsCopy_Median_SigmBg_210126172525.txt", 
+                  "../processed_data/_ExportstosDBstsCopy_Signal_Saturation_210126172525.txt") %>% filter(SampleName != "TOTAL")
+
+```
+
+## QC Initial Steps and Groups Assignments
+
+We will perform a couple of quality control steps to deal with negative values in the data and adjust based on signal saturation (optional). Next, we will define a new column to represent the grouping. And then, we will extract end point signal values
+
+```{r qcSteps, include=T, cache=TRUE}
+# qc processing
+krsa_qc_steps(data) -> data
+
+# Define sample groups
+data %>% mutate(Group = SampleName, SampleName = paste0(SampleName,"_" ,Barcode)) -> data
+
+# extract end level signal values @ all max exposure time (200ms)
+krsa_extractEndPointMaxExp(data, chipType) -> data_pw_200
+
+# extract end level signal values end level @ all exposure times
+krsa_extractEndPoint(data, chipType) -> data_pw 
+
+
+```
+
+## QC Steps and Model Fitting
+
+We will filter out peptides with low signals. In order to combine the values from different exposure times into a single value, a simple linear regression model of the *Medain_SigmBg* as a function of exposure time is fitted. The slope of of the model fit and $R^2$ are then used for quality control and samples comparison. The slope is also scaled by multiplying by 100 and log2 transformed (*Slope_Transformed*). We then filter out peptides with poor linear fit and references peptides.
+
+```{r model, warning=F,include=T, cache=TRUE}
+
+# Filter out peptides with low signals
+krsa_filter_lowPeps(data_pw_200, 2) -> ppPassAll
+
+# Fit the linear model
+# This will produce a list of data frames:
+# scaled: the Slope_Transformed values (see above for more info on Slope_Transformed)
+# normalized: the Slope_Transformed values but normalized by Chip/Barcode
+# Grouped: The mean of Slope_Transformed values for all samples within a group
+krsa_scaleModel(data_pw, ppPassAll) -> data_modeled
+  
+# Filter out peptides weak linear fit
+krsa_filter_nonLinear(data_modeled$scaled, 0.8) -> ppPassR2
+
+# Filter out reference peptides
+krsa_filter_ref_pep(ppPassR2) -> new_pep
+
+# save processed data
+saveRDS(data_modeled, "../processed_data/global/data_modelded.rds")
+saveRDS(new_pep, "../processed_data/global/qc_peptides.rds")
+saveRDS(data_pw_200, "../processed_data/global/data_pw_200.rds")
+```
+
+## Global Signal Intensity
+
+### Global Violin Plots
+
+We will plot violin figures to examine global signal differences between groups/samples.
+
+```{r violinPlot, echo=F,fig.height=6, fig.width=6, fig.align="center", cache=TRUE}
+
+# grouped
+krsa_violin_plot_grouped(data_modeled$scaled, peptides = new_pep, test = F, lines = F, avg_line = T, dots = F)
+
+```
+
+### Global Heatmaps
+
+The heatmap represent all the peptides present on the chip except the positive/internal controls and peptides that failed to pass QC. The heatmaps are scaled by row to highlight the peptide signal differences across the samples. A hierarchical unsupervised clustering is applied both on the peptides and the samples to potentially group similar signatures.
+
+```{r heatmapPlot, echo=F,fig.height=8, fig.width=8, fig.align="center", cache=TRUE}
+
+# Generates a heatmap using the modeled normalized data
+krsa_heatmap(data_modeled$normalized, new_pep, scale = "row", fontsize_col = 7)
+
+
+```
